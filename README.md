@@ -21,9 +21,10 @@ Heres some stuff it has:
 - Direct GPIO controls in the terminal (read write etc)
 - Fuzzy command matching
 
-Unfortunately theres still a plethora of issues:
+Unfortunately theres still some of issues:
 - I dont think GBasic scripts can run for some reason but I've not tested it thoroughly. I think theres still a lot of issues with it though.
 - Keyboard likes to drop keys (I'm not certain but I believe its because of how the keyboard is interacted with)
 - I dont believe wifi works
+- More probably
 
 Ultimately I understand and enjoy OS's and hardware. I just cant stand coding whatsoever.
