@@ -1,0 +1,2160 @@
+// ================================================================
+// GigaOS.ino  --  v1.0 beta
+// Arduino GIGA R1 WiFi  |  STM32H747XI  |  mbed OS
+//
+// SACRED FILE -- do not restructure after initial setup.
+// To add commands: see EXPANSION SLOTS near the bottom.
+// To add apps:     add a #include in the INCLUDE SLOT block.
+// ================================================================
+
+// ================================================================
+// INCLUDES
+// ================================================================
+#include <stdarg.h>
+#include <math.h>
+#include <Wire.h>
+#include "Arduino_GigaDisplay_GFX.h"
+#include "USBHostGiga.h"
+#include "mbed.h"
+#include "mbed_stats.h"
+#include "mbed_mktime.h"
+#include "netsocket/ICMPSocket.h"   // real ICMP ping -- requires raw sockets (enabled on GIGA M7)
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <SD.h>
+#include "SDRAM.h"
+// ================================================================
+// APP INCLUDE SLOT
+// When an app is ready, add one line here.
+// Example: #include "apps/basic.h"
+// ================================================================
+// #include "apps/basic.h"
+// #include "apps/fs_cmds.h"
+// #include "apps/edit.h"
+// #include "apps/net_cmds.h"
+// #include "apps/lang.h"
+
+// ================================================================
+// USER CONFIG -- edit before first use
+// ================================================================
+#define NTP_SERVER          "pool.ntp.org"
+#define NTP_LOCAL_PORT      2390
+#define TIMEZONE_HOURS      -5      // UTC offset (EST=-5, PST=-8, UTC=0, etc.)
+#define SD_CS_PIN           10      // SD card SPI chip select
+
+// ================================================================
+// DISPLAY LAYOUT CONSTANTS
+// ================================================================
+#define DISP_W          800
+#define DISP_H          480
+#define TOPBAR_H        32
+#define TOPBAR_SEP_Y    32
+#define TERM_Y          33
+#define TERM_H          (DISP_H - TERM_Y)
+#define TERM_FONT_SZ    2
+#define TERM_CW         12          // char width  at textSize(2)  (6*2)
+#define TERM_CH         16          // char height at textSize(2)  (8*2)
+#define TERM_COLS       (DISP_W / TERM_CW)             // 66 columns
+#define TERM_ROWS_VIS   ((TERM_H / TERM_CH) - 1)       // visible rows (minus input row)
+#define TOPBAR_FONT_SZ  2
+#define TOPBAR_CH       16          // char height at textSize(2)
+
+// ================================================================
+// COLORS (RGB565)
+// ================================================================
+#define COL_BG          0x0000      // black
+#define COL_TOPBAR      0x2104      // very dark gray
+#define COL_TOPBAR_SEP  0x4208      // dark gray separator line
+#define COL_TOPBAR_TXT  0xFFFF      // white
+#define COL_TEXT        0xC618      // light gray
+#define COL_PROMPT      0x07E0      // green
+#define COL_INPUT       0xFFE0      // yellow
+#define COL_ERROR       0xF800      // red
+#define COL_INFO        0x07FF      // cyan
+#define COL_DIM         0x8410      // medium gray
+
+// ================================================================
+// TERMINAL BUFFER
+// ================================================================
+#define TERM_SCROLLBACK  200
+#define TERM_LINE_LEN    (TERM_COLS + 1)
+
+struct TermLine {
+    char     text[TERM_LINE_LEN];
+    uint16_t color;
+};
+
+static TermLine      termBuf[TERM_SCROLLBACK];
+static int           termCount         = 0;
+static volatile bool termDirty         = true;
+static bool          termVisScroll     = false;  // visual scroll occurred -> need full redraw
+static bool          termWasCleared    = false;  // cmd_clear was run -> force screen wipe
+static int           lastRenderedCount = 0;      // line count at last drawTerminal()
+static char          inputBuf[TERM_LINE_LEN];
+static int           inputLen          = 0;
+
+// Keyboard debounce state
+static uint32_t lastKeyMs   = 0;
+static uint8_t  lastHIDKey  = 0;
+
+// Serial input -- accepts commands from USB serial (Arduino IDE / any terminal)
+// Mirrors all terminal output back to Serial automatically.
+// gbasic new/edit are blocked (they require the display + keyboard).
+static char     serialBuf[TERM_LINE_LEN];
+static int      serialBufLen = 0;
+static bool     gSerialActive = false;  // set true once first serial byte received
+
+// Capslock state -- toggled by HID 0x39, shown as "A" in cursor
+static bool gCapslockOn = false;
+
+// Input mode -- for interactive multi-step prompts (wifi setup)
+enum InputMode { MODE_SHELL, MODE_WIFI_SSID, MODE_WIFI_PASS };
+static InputMode gInputMode  = MODE_SHELL;
+static bool      gPassMasked = false;
+
+static const char* currentPrompt() {
+    switch (gInputMode) {
+        case MODE_WIFI_SSID: return "Network name: ";
+        case MODE_WIFI_PASS: return "Password:     ";
+        default:             return "GigaOS> ";
+    }
+}
+
+// Command history (arrow up/down)
+#define HISTORY_SIZE 20
+static String    cmdHistory[HISTORY_SIZE];
+static int       historyCount = 0;
+static int       historyPos   = 0;
+static int       historyIdx   = -1;
+static String    historySaved = "";
+
+// Cursor blink state
+static bool     gCursorVisible    = true;
+static uint32_t gLastCursorToggle = 0;
+
+// Top bar spinner
+static int        gSpinnerFrame = 0;
+static const char kSpin[]       = "|/-\\";
+
+// OS app mode -- routes keyboard and rendering in loop()
+// GigaOSMode defined in gbasic.h
+static volatile int gOSMode = 0;  // 0=shell, 1=gbasic_edit, 2=gbasic_run
+
+// Ping task state
+static rtos::Thread      pingTask(osPriorityLow, 4096, nullptr, "GigaOS/ping");
+static rtos::EventFlags  pingEvt;
+static char              gPingHost[128]  = "";
+static int               gPingCount      = 4;
+static volatile bool     gPingRunning    = false;
+#define PINGEVT_START    0x01
+
+// ================================================================
+// COMMAND REGISTRY
+// ================================================================
+struct Command {
+    const char* name;
+    const char* usage;
+    const char* description;
+    void (*fn)(String args);
+};
+
+// -- Forward declarations --
+void cmd_help(String args);
+void cmd_rtc(String args);
+void cmd_cpustat(String args);
+void cmd_clear(String args);
+void cmd_uptime(String args);
+void cmd_wifi(String args);
+void cmd_echo(String args);
+void cmd_reboot(String args);
+void cmd_sysinfo(String args);
+void cmd_math(String args);
+void cmd_ping(String args);
+void cmd_mem(String args);
+void cmd_date(String args);
+void cmd_uname(String args);
+void cmd_ifconfig(String args);
+void cmd_nslookup(String args);
+void cmd_threads(String args);
+void cmd_units(String args);
+void cmd_hex(String args);
+void cmd_bin(String args);
+void cmd_i2c(String args);
+void cmd_gpio(String args);
+void cmd_gbasic(String args);
+void cmd_ps(String args);
+void cmd_kill(String args);
+// EXPANSION: add forward declarations here before adding to the table
+
+// -- Command table --
+// Sacred. Only ADD entries. Never remove or reorder.
+static const Command commands[] = {
+    { "help",
+      "help [command]",
+      "List all commands, or describe a specific one",
+      cmd_help },
+
+    { "rtc",
+      "rtc [show | time | date | set HH:MM:SS DD/MM/YYYY | sync]",
+      "Show, set, or NTP-sync the system clock",
+      cmd_rtc },
+
+    { "cpustat",
+      "cpustat",
+      "Full CPU stats: uptime, busy/idle %, die temperature",
+      cmd_cpustat },
+
+    { "clear",
+      "clear",
+      "Clear the terminal screen",
+      cmd_clear },
+
+    { "uptime",
+      "uptime",
+      "Show system uptime",
+      cmd_uptime },
+
+    { "wifi",
+      "wifi [setup | connect SSID PASS | status | disconnect]",
+      "Manage WiFi -- setup is interactive, connect is one-liner",
+      cmd_wifi },
+
+    { "echo",
+      "echo [-textcolor RRGGBB] <text>",
+      "Print text; optional 24-bit hex color e.g. -textcolor FF4400",
+      cmd_echo },
+
+    { "reboot",
+      "reboot",
+      "Reboot the board",
+      cmd_reboot },
+
+    { "sysinfo",
+      "sysinfo",
+      "Show hardware and OS info: CPU ID, compiler, RAM/ROM regions",
+      cmd_sysinfo },
+
+    { "math",
+      "math <expression>",
+      "Evaluate a math expression  (+  -  *  /  %  ^  parentheses)",
+      cmd_math },
+
+    { "ping",
+      "ping <host> [-c count]",
+      "ICMP ping a host or IP. -c sets packet count; omit to send 100",
+      cmd_ping },
+
+    { "mem",
+      "mem",
+      "Show heap memory usage (used / free / peak)",
+      cmd_mem },
+
+    { "date",
+      "date",
+      "Show current date and time (shortcut for 'rtc show')",
+      cmd_date },
+
+    { "uname",
+      "uname",
+      "Print board and OS identification",
+      cmd_uname },
+
+    { "ifconfig",
+      "ifconfig",
+      "Network interface: IP, subnet, gateway, MAC, SSID, RSSI",
+      cmd_ifconfig },
+
+    { "nslookup",
+      "nslookup <host>",
+      "DNS lookup -- resolve hostname to IP address",
+      cmd_nslookup },
+
+    { "threads",
+      "threads",
+      "List all mbed RTOS threads with stack usage",
+      cmd_threads },
+
+    { "units",
+      "units <value> <from> <to>",
+      "Unit converter (C/F/K, km/mi, kg/lb, m/ft, kmh/mph...)",
+      cmd_units },
+
+    { "hex",
+      "hex <number>",
+      "Show number in dec, hex, and binary (accepts any base in)",
+      cmd_hex },
+
+    { "bin",
+      "bin <number>",
+      "Show number in dec, hex, and binary (accepts any base in)",
+      cmd_bin },
+
+    { "i2c",
+      "i2c <scan | read <addr> [reg] [count]>",
+      "Scan I2C bus for devices or read bytes from one",
+      cmd_i2c },
+
+    { "gpio",
+      "gpio <pin> <read | write <high|low> | mode <...> | adc>",
+      "Read, write, configure, or analog-read a GPIO pin",
+      cmd_gpio },
+
+    { "gbasic",
+      "gbasic <run|edit|new|list|delete|ps|kill|schedule|...> [args]",
+      "GBasic interpreter -- run, edit, manage .gbpf programs",
+      cmd_gbasic },
+
+    { "ps",
+      "ps [--resources]",
+      "List all threads and optionally resource claims",
+      cmd_ps },
+
+    { "kill",
+      "kill <pid|name|prefix>",
+      "Terminate a GBasic script or background task",
+      cmd_kill },
+
+    // -- EXPANSION SLOTS ------------------------------------------
+    // Add new commands here as:
+    //   { "name", "name <args>", "description", cmd_name },
+    //
+    // SLOT: BASIC interpreter
+    //   { "basic",  "basic [file.bas]",        "Run the BASIC interpreter",     cmd_basic  },
+    //
+    // SLOT: Filesystem commands (enable after SD is wired)
+    //   { "ls",     "ls [path]",               "List directory contents",        cmd_ls     },
+    //   { "cat",    "cat <file>",              "Print file to terminal",         cmd_cat    },
+    //   { "rm",     "rm <file>",               "Remove a file",                  cmd_rm     },
+    //   { "cp",     "cp <src> <dst>",          "Copy a file",                    cmd_cp     },
+    //   { "mkdir",  "mkdir <dir>",             "Create a directory",             cmd_mkdir  },
+    //   { "pwd",    "pwd",                     "Print working directory",        cmd_pwd    },
+    //   { "cd",     "cd <path>",               "Change directory",              cmd_cd     },
+    //
+    // SLOT: Text editor
+    //   { "edit",   "edit <file>",             "Open the text editor",           cmd_edit   },
+    //
+    // SLOT: Networking
+    //   { "fetch",  "fetch <url>",             "HTTP GET a URL",                 cmd_fetch  },
+    //   { "ping",   "ping <host>",             "Ping a hostname",                cmd_ping   },
+    //
+    // SLOT: Custom scripting language
+    //   { "run",    "run <file>",              "Run a script",                  cmd_run    },
+    //
+    // SLOT: System info extras
+    //   { "mem",    "mem",                     "Show memory usage",             cmd_mem    },
+    //   { "threads","threads",                 "List mbed RTOS threads",        cmd_threads},
+    // -------------------------------------------------------------
+};
+static const int CMD_COUNT = sizeof(commands) / sizeof(commands[0]);
+
+// ================================================================
+// GLOBAL OBJECTS
+// ================================================================
+static GigaDisplay_GFX  display;
+static Keyboard          keyb;
+
+// mbed RTOS -- threads and sync primitives
+static rtos::Thread      statsTask(osPriorityBelowNormal, 4096, nullptr, "GigaOS/stats");  // CPU stats
+static rtos::Thread      wifiTask(osPriorityLow, 4096, nullptr, "GigaOS/wifi");             // WiFi ops
+static rtos::Thread      gbasicFgTask(osPriorityLow, 8192, nullptr, "GBasic/fg");           // GBasic fg
+static rtos::Thread      gbasicSched(osPriorityLow, 2048, nullptr, "GigaOS/scheduler");     // GBasic sched
+static rtos::Mutex       dispMtx;       // protects display access
+static rtos::Mutex       termMtx;       // protects terminal buffer
+static rtos::Mutex       statMtx;       // protects gBusy1s / gTempF
+static rtos::EventFlags  wifiEvt;       // signals to wifi task
+
+#define WIFIEVT_CONNECT     0x01
+#define WIFIEVT_DISCONNECT  0x02
+
+// CPU stats -- written by statsTask, read by main thread and drawTopBar
+// mbed_stats_cpu_get() confirmed working on GIGA R1 -- MBED_ALL_STATS_ENABLED=1
+// is already compiled into libmbed.a for the GIGA variant.
+static float    gBusy1s    = 0.0f;
+static float    gTempF     = 0.0f;
+static uint64_t gPrevIdle  = 0;
+static uint64_t gPrevUp    = 0;
+
+// WiFi state
+static volatile bool gWifiConnected  = false;
+static volatile bool gWifiConnecting = false;
+static char          gWifiSSID[64]   = "";
+static char          gWifiPass[64]   = "";
+static bool          gNtpSynced      = false;
+
+// ================================================================
+// HELPERS -- CPU die temperature
+// STM32H7 factory cal values burned into flash at production.
+// Reads ADC3 ch18 (internal sensor) and interpolates.
+// Note: reads die temp (not air); expect 45-60F above ambient at load.
+// ================================================================
+#define TS_CAL1  (*(volatile uint16_t*)0x1FF1E820UL)  // cal at 30C
+#define TS_CAL2  (*(volatile uint16_t*)0x1FF1E840UL)  // cal at 110C
+
+
+// I  | II
+// --------
+// II | I_
+// i loss my code
+
+
+static float readTempF() {
+    // STM32H747 internal temperature sensor.
+    // Returns degrees F, or -1.0f if unavailable (shown as "---" in UI).
+    //
+    // The factory calibration values are burned into system flash:
+    //   TS_CAL1 @ 0x1FF1E820 = raw ADC count at 30C (3.3V)
+    //   TS_CAL2 @ 0x1FF1E840 = raw ADC count at 110C (3.3V)
+    uint16_t cal1 = TS_CAL1, cal2 = TS_CAL2;
+    if (!cal1 || !cal2 || cal1 >= cal2 ||
+        cal1 == 0xFFFF || cal2 == 0xFFFF)
+        return -1.0f;   // cal data missing or corrupted
+
+    float raw = -1.0f;
+
+    // Attempt 1: ATEMP pin (defined in some ArduinoCore-mbed versions)
+#ifdef ATEMP
+    analogReadResolution(16);
+    raw = (float)analogRead(ATEMP);
+#endif
+
+    // Attempt 2: ADC_TEMP (mbed PinName for internal temp channel on STM32H7)
+#if !defined(ATEMP) && defined(ADC_TEMP)
+    {
+        static mbed::AnalogIn* tSense = nullptr;
+        if (!tSense) tSense = new mbed::AnalogIn(ADC_TEMP);
+        if (tSense)  raw = tSense->read() * 65535.0f;
+    }
+#endif
+
+    // Attempt 3: PADC_TEMP (alternate name used in some STM32 cores)
+#if !defined(ATEMP) && !defined(ADC_TEMP) && defined(PADC_TEMP)
+    analogReadResolution(16);
+    raw = (float)analogRead(PADC_TEMP);
+#endif
+
+    if (raw < 0.0f) return -1.0f;  // nothing worked
+
+    float degC = (80.0f / (float)(cal2 - cal1)) * (raw - (float)cal1) + 30.0f;
+    return degC * 9.0f / 5.0f + 32.0f;
+}
+
+// ================================================================
+// HELPERS -- RTC
+// ================================================================
+static String rtcTime() {
+    char buf[16];
+    tm t;
+    _rtc_localtime(time(NULL), &t, RTC_4_YEAR_LEAP_YEAR_SUPPORT);
+    strftime(buf, sizeof(buf), "%I:%M:%S %p", &t);
+    return String(buf);
+}
+
+static String rtcDateTime() {
+    char buf[32];
+    tm t;
+    _rtc_localtime(time(NULL), &t, RTC_4_YEAR_LEAP_YEAR_SUPPORT);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %I:%M:%S %p", &t);
+    return String(buf);
+}
+
+static String fmtUptime(uint64_t us) {
+    uint32_t sec = (uint32_t)(us / 1000000ULL);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
+             sec / 3600, (sec % 3600) / 60, sec % 60);
+    return String(buf);
+}
+
+// Convenience overload using millis() when no mbed_stats_cpu_t is available
+static String fmtUptime() {
+    return fmtUptime((uint64_t)millis() * 1000ULL);
+}
+
+// ================================================================
+// HELPERS -- NTP
+// ================================================================
+static const int NTP_PKT_SZ = 48;
+static byte      ntpBuf[NTP_PKT_SZ];
+static WiFiUDP   ntpUdp;
+
+static void ntpSend(const char* host) {
+    memset(ntpBuf, 0, NTP_PKT_SZ);
+    ntpBuf[0]  = 0b11100011;  // LI, Version, Mode
+    ntpBuf[1]  = 0; ntpBuf[2] = 6; ntpBuf[3] = 0xEC;
+    ntpBuf[12] = 49; ntpBuf[13] = 0x4E;
+    ntpBuf[14] = 49; ntpBuf[15] = 52;
+    ntpUdp.beginPacket(host, 123);
+    ntpUdp.write(ntpBuf, NTP_PKT_SZ);
+    ntpUdp.endPacket();
+}
+
+static bool ntpSync() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    ntpUdp.begin(NTP_LOCAL_PORT);
+    ntpSend(NTP_SERVER);
+    delay(1500);
+    if (!ntpUdp.parsePacket()) return false;
+    ntpUdp.read(ntpBuf, NTP_PKT_SZ);
+    unsigned long hi  = word(ntpBuf[40], ntpBuf[41]);
+    unsigned long lo  = word(ntpBuf[42], ntpBuf[43]);
+    unsigned long ep  = (hi << 16 | lo) - 2208988800UL;
+    ep += (unsigned long)((long)TIMEZONE_HOURS * 3600L);
+    set_time(ep);
+    gNtpSynced = true;
+    return true;
+}
+
+// ================================================================
+// HELPERS -- Levenshtein distance (fuzzy command matching)
+// Returns edit distance between two short strings (max len 23).
+// ================================================================
+static int levenshtein(const char* a, const char* b) {
+    static int dp[24][24];
+    int la = strlen(a), lb = strlen(b);
+    if (la >= 24 || lb >= 24) return 99;
+    for (int i = 0; i <= la; i++) dp[i][0] = i;
+    for (int j = 0; j <= lb; j++) dp[0][j] = j;
+    for (int i = 1; i <= la; i++)
+        for (int j = 1; j <= lb; j++) {
+            int c = (tolower((unsigned char)a[i-1]) ==
+                     tolower((unsigned char)b[j-1])) ? 0 : 1;
+            dp[i][j] = min(min(dp[i-1][j] + 1, dp[i][j-1] + 1),
+                               dp[i-1][j-1] + c);
+        }
+    return dp[la][lb];
+}
+
+static const char* closestCmd(const char* input) {
+    int best = 99;
+    const char* name = nullptr;
+    for (int i = 0; i < CMD_COUNT; i++) {
+        int d = levenshtein(input, commands[i].name);
+        if (d < best) { best = d; name = commands[i].name; }
+    }
+    return (best <= 3) ? name : nullptr;
+}
+
+// ================================================================
+// TERMINAL -- add a line to the scrollback buffer
+// Thread-safe. Wraps long lines automatically.
+// ================================================================
+// helper: add one pre-measured line to the buffer
+static void termAddLine(const char* text, int len, uint16_t color) {
+    if (termCount >= TERM_ROWS_VIS) termVisScroll = true;
+    int slot;
+    if (termCount < TERM_SCROLLBACK) { slot = termCount++; }
+    else {
+        memmove(termBuf, termBuf + 1, sizeof(TermLine) * (TERM_SCROLLBACK - 1));
+        slot = TERM_SCROLLBACK - 1;
+    }
+    if (len > 0) memcpy(termBuf[slot].text, text, len);
+    termBuf[slot].text[len] = '\0';
+    termBuf[slot].color = color;
+}
+
+static void termPrint(const char* text, uint16_t color = COL_TEXT) {
+    // Mirror to Serial if a serial client is connected
+    if (gSerialActive) Serial.println(text);
+    termMtx.lock();
+    int len = strlen(text);
+    const int limit = TERM_COLS - 1;
+
+    if (len == 0) {
+        termAddLine("", 0, color);
+        termDirty = true;
+        termMtx.unlock();
+        return;
+    }
+    int pos = 0;
+    while (pos < len) {
+        int remaining = len - pos;
+        if (remaining <= limit) {
+            termAddLine(text + pos, remaining, color);
+            break;
+        }
+        // Word-aware: search backward from limit for a space
+        int brk = limit;
+        for (int i = limit; i > 0; i--) {
+            if (text[pos + i] == ' ') { brk = i; break; }
+        }
+        termAddLine(text + pos, brk, color);
+        pos += brk;
+        if (pos < len && text[pos] == ' ') pos++;
+    }
+    termDirty = true;
+    termMtx.unlock();
+}
+
+// Convenience overloads
+static void termPrint(String s, uint16_t color = COL_TEXT) {
+    termPrint(s.c_str(), color);
+}
+
+// Printf-style terminal output
+static void termPrintf(uint16_t color, const char* fmt, ...) {
+    char buf[TERM_LINE_LEN];
+    va_list v;
+    va_start(v, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, v);
+    va_end(v);
+    termPrint(buf, color);
+}
+
+// ================================================================
+// RENDERER -- top bar
+// Called from statsTask every 1s; uses dispMtx for thread safety.
+// ================================================================
+static void drawTopBar() {
+    dispMtx.lock();
+
+    // Background + separator
+    display.fillRect(0, 0, DISP_W, TOPBAR_H, COL_TOPBAR);
+    display.drawFastHLine(0, TOPBAR_SEP_Y, DISP_W, COL_TOPBAR_SEP);
+    display.setTextSize(TOPBAR_FONT_SZ);
+    display.setTextColor(COL_TOPBAR_TXT);
+
+    int ty = (TOPBAR_H - TOPBAR_CH) / 2;
+
+    // LEFT -- cpu% (last 1s) + die temp in F, monospace width
+    statMtx.lock();
+    float busy = gBusy1s;
+    float temp = gTempF;
+    statMtx.unlock();
+
+    char left[32];
+    if (temp < 0.0f)
+        snprintf(left, sizeof(left), "CPU:%3.0f%%  ---F", busy);
+    else
+        snprintf(left, sizeof(left), "CPU:%3.0f%%  %5.1fF", busy, temp);
+    display.setCursor(4, ty);
+    display.print(left);
+
+    // CENTER -- current time
+    String ts = rtcTime();
+    int    tw = ts.length() * 6;    // 6px per char at textSize(1)
+    display.setCursor((DISP_W - tw) / 2, ty);
+    display.print(ts);
+
+    // RIGHT -- spinner when working, SSID when connected+idle, blank otherwise
+    bool working = gWifiConnecting || gPingRunning;
+    char right[32] = "";
+    if (working) {
+        gSpinnerFrame = (gSpinnerFrame + 1) % 4;
+        snprintf(right, sizeof(right), "Working %c", kSpin[gSpinnerFrame]);
+    } else if (gWifiConnected) {
+        snprintf(right, sizeof(right), "%.22s", WiFi.SSID());
+    }
+    if (right[0]) {
+        int rw = strlen(right) * 6 * TOPBAR_FONT_SZ;
+        display.setCursor(DISP_W - rw - 4, ty);
+        display.print(right);
+    }
+
+    dispMtx.unlock();
+}
+
+// ================================================================
+// RENDERER -- full terminal area redraw
+// Only runs when termDirty == true.
+// ================================================================
+static void drawTerminal() {
+    if (!termDirty) return;
+
+    dispMtx.lock();
+    display.setTextSize(TERM_FONT_SZ);
+
+    termMtx.lock();
+
+    // Decide: full redraw or incremental append
+    bool doFull = termVisScroll || termWasCleared ||
+                  (termCount < lastRenderedCount) ||
+                  (lastRenderedCount == 0 && termCount > 0);
+    termVisScroll  = false;
+    termWasCleared = false;
+
+    if (doFull) {
+        // Full redraw -- clear everything and repaint all visible lines
+        display.fillRect(0, TERM_Y, DISP_W, TERM_H, COL_BG);
+        int first = max(0, termCount - TERM_ROWS_VIS);
+        int count = termCount - first;
+        for (int i = 0; i < count; i++) {
+            display.setCursor(0, TERM_Y + i * TERM_CH);
+            display.setTextColor(termBuf[first + i].color);
+            display.print(termBuf[first + i].text);
+        }
+    } else {
+        // Incremental -- only paint lines added since last render
+        // (safe when termCount <= TERM_ROWS_VIS, no visual scrolling)
+        for (int i = lastRenderedCount; i < termCount && i < TERM_ROWS_VIS; i++) {
+            int y = TERM_Y + i * TERM_CH;
+            display.fillRect(0, y, DISP_W, TERM_CH, COL_BG);
+            display.setCursor(0, y);
+            display.setTextColor(termBuf[i].color);
+            display.print(termBuf[i].text);
+        }
+    }
+
+    lastRenderedCount = termCount;
+    termMtx.unlock();
+
+    // Always redraw input row (mode-aware prompt + password masking)
+    int iy = TERM_Y + TERM_ROWS_VIS * TERM_CH;
+    const char* prompt = currentPrompt();
+    int plen = strlen(prompt);
+    display.fillRect(0, iy, DISP_W, TERM_CH, COL_BG);
+    display.setCursor(0, iy);
+    display.setTextColor(COL_PROMPT);
+    display.print(prompt);
+    display.setTextColor(COL_INPUT);
+    if (gPassMasked) { for (int i=0;i<inputLen;i++) display.print('*'); }
+    else             { display.print(inputBuf); }
+    int cx = (plen + inputLen) * TERM_CW;
+    if (gCursorVisible) {
+        display.fillRect(cx, iy, TERM_CW - 2, TERM_CH, COL_INPUT);
+        if (gCapslockOn && gInputMode == MODE_SHELL) {
+            display.setCursor(cx, iy); display.setTextColor(COL_BG); display.print("A");
+        }
+    }
+
+    termDirty = false;
+    dispMtx.unlock();
+}
+
+// ================================================================
+// RENDERER -- input line only (fast update on keypress)
+// Avoids full terminal redraw for every character typed.
+// ================================================================
+static void drawInput() {
+    dispMtx.lock();
+    int iy = TERM_Y + TERM_ROWS_VIS * TERM_CH;
+    const char* prompt = currentPrompt();
+    int plen = strlen(prompt);
+    display.fillRect(0, iy, DISP_W, TERM_CH, COL_BG);
+    display.setTextSize(TERM_FONT_SZ);
+    display.setCursor(0, iy);
+    display.setTextColor(COL_PROMPT);
+    display.print(prompt);
+    display.setTextColor(COL_INPUT);
+    if (gPassMasked) {
+        for (int i = 0; i < inputLen; i++) display.print('*');
+    } else {
+        display.print(inputBuf);
+    }
+    int cx = (plen + inputLen) * TERM_CW;
+    if (gCursorVisible) {
+        display.fillRect(cx, iy, TERM_CW - 2, TERM_CH, COL_INPUT);
+        if (gCapslockOn && gInputMode == MODE_SHELL) {
+            display.setCursor(cx, iy);
+            display.setTextColor(COL_BG);
+            display.print("A");
+        }
+    }
+    dispMtx.unlock();
+}
+
+// Cursor-only redraw for blink (avoids full input redraw every 500ms)
+static void drawInputCursorOnly() {
+    dispMtx.lock();
+    int iy = TERM_Y + TERM_ROWS_VIS * TERM_CH;
+    int plen = strlen(currentPrompt());
+    int cx = (plen + inputLen) * TERM_CW;
+    display.setTextSize(TERM_FONT_SZ);
+    if (gCursorVisible) {
+        display.fillRect(cx, iy, TERM_CW - 2, TERM_CH, COL_INPUT);
+        if (gCapslockOn && gInputMode == MODE_SHELL) {
+            display.setCursor(cx, iy);
+            display.setTextColor(COL_BG);
+            display.print("A");
+        }
+    } else {
+        display.fillRect(cx, iy, TERM_CW - 2, TERM_CH, COL_BG);
+    }
+    dispMtx.unlock();
+}
+
+// ================================================================
+// SHELL -- parse and dispatch a command string
+// ================================================================
+// ================================================================
+// SERIAL DISPATCH
+// Runs a command received over Serial. Mirrors output back via Serial.
+// Blocks UI-only commands (gbasic new / gbasic edit).
+// ================================================================
+static bool gFromSerial = false;
+
+static const char* serialBlacklist[] = {
+    "gbasic new", "gbasic edit", nullptr
+};
+
+static void serialDispatch(String raw) {
+    raw.trim();
+    if (raw.length() == 0) {
+        Serial.println("GigaOS> ");
+        return;
+    }
+    // Check blacklist -- these need the display + keyboard, can't work over serial
+    for (int i = 0; serialBlacklist[i]; i++) {
+        if (raw.startsWith(serialBlacklist[i])) {
+            Serial.println("Error: '" + String(serialBlacklist[i]) + "' requires the display and keyboard.");
+            Serial.println("  Tip: use 'gbasic run', 'gbasic list', 'gbasic files' etc. from serial.");
+            Serial.println("GigaOS> ");
+            return;
+        }
+    }
+    gFromSerial = true;
+    dispatch(raw);
+    gFromSerial = false;
+    Serial.println("GigaOS> ");
+}
+
+static void dispatch(String raw) {
+    raw.trim();
+    if (raw.length() == 0) return;
+
+    // Record in history (skip consecutive duplicates)
+    int prevPos = (historyPos - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+    if (historyCount == 0 || cmdHistory[prevPos] != raw) {
+        cmdHistory[historyPos] = raw;
+        historyPos = (historyPos + 1) % HISTORY_SIZE;
+        if (historyCount < HISTORY_SIZE) historyCount++;
+    }
+
+    // Echo to terminal
+    termPrintf(COL_PROMPT, "%s%s", currentPrompt(), raw.c_str());
+
+    // Split: first word = command, rest = args
+    int    sp = raw.indexOf(' ');
+    String cn = (sp == -1) ? raw             : raw.substring(0, sp);
+    String ar = (sp == -1) ? String("")      : raw.substring(sp + 1);
+    cn.trim();
+    cn.toLowerCase();
+    ar.trim();
+
+    // Look up command
+    for (int i = 0; i < CMD_COUNT; i++) {
+        if (cn.equals(commands[i].name)) {
+            commands[i].fn(ar);
+            return;
+        }
+    }
+
+    // Not found -- fuzzy match
+    const char* suggestion = closestCmd(cn.c_str());
+    if (suggestion) {
+        termPrintf(COL_ERROR,
+                   "[%s] is an unknown command, did you mean [%s]?",
+                   cn.c_str(), suggestion);
+    } else {
+        termPrintf(COL_ERROR,
+                   "[%s] is an unknown command. Type 'help' for a list.",
+                   cn.c_str());
+    }
+}
+
+// ================================================================
+// COMMAND IMPLEMENTATIONS
+// ================================================================
+
+// -- help utilities ---------------------------------------------
+// Wrap and print a string with a fixed left-padding indent.
+// Returns number of lines printed.
+static int helpPrintWrapped(const char* prefix, const char* text, uint16_t color) {
+    int prefLen  = strlen(prefix);
+    int maxW     = TERM_COLS - prefLen - 1;
+    if (maxW < 8) maxW = 8;
+    char indent[TERM_LINE_LEN]; memset(indent, ' ', prefLen); indent[prefLen] = '\0';
+    char buf[TERM_LINE_LEN];
+    int pos = 0, len = strlen(text), lines = 0;
+    while (pos < len) {
+        int remaining = len - pos;
+        int brk = (remaining <= maxW) ? remaining : maxW;
+        if (remaining > maxW) {
+            // find last space within window
+            for (int i = brk; i > 0; i--) {
+                if (text[pos + i] == ' ') { brk = i; break; }
+            }
+        }
+        if (lines == 0)
+            snprintf(buf, sizeof(buf), "%s%.*s", prefix, brk, text + pos);
+        else
+            snprintf(buf, sizeof(buf), "%s%.*s", indent, brk, text + pos);
+        termPrint(buf, color);
+        lines++;
+        pos += brk;
+        if (pos < len && text[pos] == ' ') pos++; // skip the space we broke on
+    }
+    if (lines == 0) { termPrint(prefix, color); lines = 1; }
+    return lines;
+}
+
+void cmd_help(String args) {
+    args.trim();
+
+    // -- help <command> -- specific command detail -----------------
+    if (args.length() > 0 && !isdigit((unsigned char)args[0])) {
+        args.toLowerCase();
+        for (int i = 0; i < CMD_COUNT; i++) {
+            if (args.equals(commands[i].name)) {
+                termPrint("", COL_TEXT);
+                char hdr[TERM_LINE_LEN];
+                snprintf(hdr, sizeof(hdr), "  %s", commands[i].name);
+                termPrint(hdr, COL_INFO);
+                helpPrintWrapped("  Usage:  ", commands[i].usage,       COL_DIM);
+                helpPrintWrapped("  About:  ", commands[i].description,  COL_TEXT);
+                termPrint("", COL_TEXT);
+                return;
+            }
+        }
+        termPrintf(COL_ERROR, "Unknown command: %s", args.c_str());
+        termPrint("  Type 'help' to list all commands.", COL_DIM);
+        return;
+    }
+
+    // -- help [N] -- paginated listing -----------------------------
+    // Each entry = 1 line for name + description (possibly wrapped).
+    // Pre-compute line counts so pagination is exact.
+    const int NAME_W    = 12;       // "  name      " column
+    const int DESC_W    = TERM_COLS - NAME_W - 1;
+    const int HDR_LINES = 3;        // header + separator
+    const int FTR_LINES = 2;        // separator + footer tip
+    const int PAGE_H    = TERM_ROWS_VIS - HDR_LINES - FTR_LINES;
+
+    // Count lines per command
+    int lineCounts[64] = {};
+    for (int i = 0; i < CMD_COUNT && i < 64; i++) {
+        int dlen = strlen(commands[i].description);
+        lineCounts[i] = 1 + (dlen > DESC_W ? (dlen - 1) / DESC_W : 0);
+    }
+
+    // Assign commands to pages
+    int pageStarts[16] = {0}; int pageCount = 1;
+    int lineAcc = 0;
+    for (int i = 0; i < CMD_COUNT; i++) {
+        if (lineAcc + lineCounts[i] > PAGE_H && lineAcc > 0) {
+            if (pageCount < 16) pageStarts[pageCount++] = i;
+            lineAcc = 0;
+        }
+        lineAcc += lineCounts[i];
+    }
+
+    int page = 1;
+    if (args.length() > 0) page = args.toInt();
+    if (page < 1) page = 1;
+    if (page > pageCount) page = pageCount;
+
+    int startCmd = pageStarts[page - 1];
+    int endCmd   = (page < pageCount) ? pageStarts[page] : CMD_COUNT;
+
+    // Header
+    char hdr[TERM_LINE_LEN];
+    snprintf(hdr, sizeof(hdr), "  GigaOS commands -- page %d of %d", page, pageCount);
+    termPrint(hdr, COL_INFO);
+    termPrint("  --------------------------------------------------------------", COL_DIM);
+    termPrint("", COL_TEXT);
+
+    // Entries
+    for (int i = startCmd; i < endCmd; i++) {
+        char nameCol[NAME_W + 1];
+        snprintf(nameCol, sizeof(nameCol), "  %-*s", NAME_W - 2, commands[i].name);
+        helpPrintWrapped(nameCol, commands[i].description, COL_TEXT);
+    }
+
+    // Footer
+    termPrint("", COL_TEXT);
+    termPrint("  --------------------------------------------------------------", COL_DIM);
+    char ftr[TERM_LINE_LEN];
+    if (pageCount > 1)
+        snprintf(ftr, sizeof(ftr), "  'help <N>' for page N  |  'help <cmd>' for details  |  page %d/%d", page, pageCount);
+    else
+        snprintf(ftr, sizeof(ftr), "  'help <command>' for usage and details");
+    termPrint(ftr, COL_DIM);
+}
+
+void cmd_rtc(String args) {
+    // rtc / rtc show -- full date + time
+    if (args.length() == 0 || args.startsWith("show")) {
+        termPrint(rtcDateTime(), COL_INFO);
+        if (!gNtpSynced)
+            termPrint("  (not NTP synced -- run 'rtc sync' when on WiFi)", COL_DIM);
+        return;
+    }
+
+    // rtc time -- time only
+    if (args.startsWith("time")) {
+        termPrint(rtcTime(), COL_INFO);
+        return;
+    }
+
+    // rtc date -- date only
+    if (args.startsWith("date")) {
+        char buf[16]; tm t;
+        _rtc_localtime(time(NULL), &t, RTC_4_YEAR_LEAP_YEAR_SUPPORT);
+        strftime(buf, sizeof(buf), "%Y-%m-%d", &t);
+        termPrint(String(buf), COL_INFO);
+        return;
+    }
+
+    // rtc sync
+    if (args.startsWith("sync")) {
+        if (!gWifiConnected) {
+            termPrint("Error: not connected to WiFi.", COL_ERROR);
+            termPrint("       Use 'wifi connect SSID PASS' first.", COL_DIM);
+            return;
+        }
+        termPrint("Syncing via NTP...", COL_INFO);
+        if (ntpSync())
+            termPrint("Synced: " + rtcDateTime(), COL_INFO);
+        else
+            termPrint("NTP sync failed.", COL_ERROR);
+        return;
+    }
+
+    // rtc set HH:MM:SS DD/MM/YYYY
+    if (args.startsWith("set ")) {
+        String p = args.substring(4);
+        p.trim();
+        int si = p.indexOf(' ');
+        if (si == -1) {
+            termPrint("Error: missing date argument.", COL_ERROR);
+            termPrint("       Usage:   rtc set HH:MM:SS DD/MM/YYYY", COL_DIM);
+            termPrint("       Example: rtc set 14:30:00 28/05/2026", COL_DIM);
+            return;
+        }
+        String ts = p.substring(0, si);
+        String ds = p.substring(si + 1);
+        int h, mi, s, d, mo, y;
+        if (sscanf(ts.c_str(), "%d:%d:%d", &h, &mi, &s) != 3 ||
+            sscanf(ds.c_str(), "%d/%d/%d", &d, &mo, &y) != 3) {
+            termPrint("Error: could not parse time or date.", COL_ERROR);
+            termPrint("       Expected format: HH:MM:SS DD/MM/YYYY", COL_DIM);
+            return;
+        }
+        if (h  < 0 || h  > 23)   { termPrint("Error: hour must be 0-23.",    COL_ERROR); return; }
+        if (mi < 0 || mi > 59)   { termPrint("Error: minute must be 0-59.",  COL_ERROR); return; }
+        if (s  < 0 || s  > 59)   { termPrint("Error: second must be 0-59.",  COL_ERROR); return; }
+        if (d  < 1 || d  > 31)   { termPrint("Error: day must be 1-31.",     COL_ERROR); return; }
+        if (mo < 1 || mo > 12)   { termPrint("Error: month must be 1-12.",   COL_ERROR); return; }
+        if (y  < 2000 || y > 2100) { termPrint("Error: year must be 2000-2100.", COL_ERROR); return; }
+
+        tm t     = {};
+        t.tm_hour = h;  t.tm_min  = mi; t.tm_sec  = s;
+        t.tm_mday = d;  t.tm_mon  = mo - 1; t.tm_year = y - 1900;
+        set_time(mktime(&t));
+        gNtpSynced = false;
+        termPrint("Time set: " + rtcDateTime(), COL_INFO);
+        return;
+    }
+
+    termPrint("Error: unknown subcommand.", COL_ERROR);
+    termPrint("       Usage: rtc [show | time | date | set HH:MM:SS DD/MM/YYYY | sync]", COL_DIM);
+}
+
+void cmd_cpustat(String args) {
+    mbed_stats_cpu_t cpu;
+    mbed_stats_cpu_get(&cpu);
+
+    uint8_t itot = (cpu.uptime > 0)
+                   ? (uint8_t)((cpu.idle_time * 100ULL) / cpu.uptime)
+                   : 0;
+    statMtx.lock();
+    float b1 = gBusy1s;
+    float tf = gTempF;
+    statMtx.unlock();
+
+    termPrint("-- CPU Statistics -----------------------", COL_INFO);
+    termPrintf(COL_TEXT, "  Uptime:          %s",              fmtUptime(cpu.uptime).c_str());
+    termPrintf(COL_TEXT, "  All-time busy:   %3u%%   idle: %3u%%", 100 - itot, itot);
+    termPrintf(COL_TEXT, "  Last 1s busy:    %3.0f%%   idle: %3.0f%%", b1, 100.0f - b1);
+    if (tf < 0.0f)
+        termPrint("  Die temperature: --- (sensor pin not defined in this core)",COL_DIM);
+    else
+        termPrintf(COL_TEXT, "  Die temperature: %.1f F", tf);
+    termPrint("  Core:   STM32H747XI Cortex-M7 @ 480MHz",      COL_DIM);
+    termPrint("  RAM:    1MB SRAM  +  8MB SDRAM",               COL_DIM);
+    termPrint("-----------------------------------------",      COL_DIM);
+}
+
+void cmd_clear(String args) {
+    termMtx.lock();
+    termCount         = 0;
+    lastRenderedCount = 0;
+    termVisScroll     = false;
+    termWasCleared    = true;   // signals drawTerminal() to wipe the screen
+    memset(termBuf, 0, sizeof(termBuf));
+    termDirty = true;
+    termMtx.unlock();
+}
+
+void cmd_uptime(String args) {
+    mbed_stats_cpu_t cpu;
+    mbed_stats_cpu_get(&cpu);
+    termPrint("up " + fmtUptime(cpu.uptime), COL_INFO);
+}
+
+void cmd_wifi(String args) {
+    // Interactive setup mode -- prompts SSID then password
+    if (args.startsWith("setup") || args == "setup") {
+        if (gWifiConnecting) {
+            termPrint("Already connecting. Use 'wifi disconnect' first.", COL_ERROR);
+            return;
+        }
+        gWifiSSID[0] = '\0'; gWifiPass[0] = '\0';
+        gInputMode  = MODE_WIFI_SSID;
+        gPassMasked = false;
+        termPrint("Wi-Fi Interactive Setup  (Escape to cancel)", COL_INFO);
+        return;
+    }
+    if (args.length() == 0 || args.startsWith("status")) {
+        if (gWifiConnecting) {
+            termPrint("WiFi: connecting...", COL_INFO);
+        } else if (gWifiConnected) {
+            IPAddress ip = WiFi.localIP();
+            termPrintf(COL_INFO, "WiFi: connected to [%s]", WiFi.SSID());
+            termPrintf(COL_TEXT, "      IP: %d.%d.%d.%d   RSSI: %ld dBm",
+                       ip[0], ip[1], ip[2], ip[3], (long)WiFi.RSSI());
+            termPrintf(COL_DIM,  "      NTP synced: %s", gNtpSynced ? "yes" : "no");
+        } else {
+            termPrint("WiFi: not connected", COL_DIM);
+        }
+        return;
+    }
+
+    if (args.startsWith("disconnect")) {
+        gWifiConnecting = false;
+        gWifiConnected  = false;
+        wifiEvt.set(WIFIEVT_DISCONNECT);
+        termPrint("WiFi: disconnecting...", COL_INFO);
+        return;
+    }
+
+    if (args.startsWith("connect ")) {
+        if (gWifiConnecting) {
+            termPrint("Error: already connecting. Wait or run 'wifi disconnect'.", COL_ERROR);
+            return;
+        }
+        String p = args.substring(8);
+        p.trim();
+        int si = p.indexOf(' ');
+        if (si == -1) {
+            termPrint("Error: missing password argument.", COL_ERROR);
+            termPrint("       Usage: wifi connect <SSID> <password>", COL_DIM);
+            return;
+        }
+        p.substring(0, si).toCharArray(gWifiSSID, sizeof(gWifiSSID));
+        p.substring(si + 1).toCharArray(gWifiPass, sizeof(gWifiPass));
+        gWifiConnecting = true;
+        gWifiConnected  = false;
+        termPrintf(COL_INFO, "Connecting to [%s] in background...", gWifiSSID);
+        wifiEvt.set(WIFIEVT_CONNECT);
+        return;
+    }
+
+    termPrint("Error: unknown subcommand.", COL_ERROR);
+    termPrint("       Usage: wifi [connect SSID PASS | status | disconnect]", COL_DIM);
+}
+
+void cmd_echo(String args) {
+    uint16_t color = COL_TEXT;
+    if (args.startsWith("-textcolor ")) {
+        String rest = args.substring(11); rest.trim();
+        int sp = rest.indexOf(' ');
+        String hexStr = (sp == -1) ? rest : rest.substring(0, sp);
+        if (hexStr.length() == 6) {
+            uint32_t rgb = (uint32_t)strtol(hexStr.c_str(), nullptr, 16);
+            uint8_t r=(rgb>>16)&0xFF, g=(rgb>>8)&0xFF, b=rgb&0xFF;
+            color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+            args = (sp == -1) ? String("") : rest.substring(sp + 1);
+        } else {
+            termPrint("Error: -textcolor needs 6-digit hex (e.g. FF4400).", COL_ERROR);
+            return;
+        }
+    }
+    termPrint(args.c_str(), color);
+}
+
+void cmd_reboot(String args) {
+    termPrint("Rebooting...", COL_INFO);
+    drawTerminal();
+    delay(800);
+    NVIC_SystemReset();
+}
+
+// ================================================================
+// MATH -- recursive descent expression evaluator
+// Supports: + - * / % ^ () unary minus
+// ================================================================
+struct MathParser {
+    const char* s;
+    int         pos;
+    bool        err;
+    char        errAt[32];
+
+    void skip() { while (s[pos]==' '||s[pos]=='\t') pos++; }
+
+    double expr() {
+        double v = term(); skip();
+        while (s[pos]=='+' || s[pos]=='-') {
+            char op=s[pos++]; double r=term();
+            v = (op=='+') ? v+r : v-r; skip();
+        }
+        return v;
+    }
+    double term() {
+        double v = power(); skip();
+        while (s[pos]=='*'||s[pos]=='/'||s[pos]=='%') {
+            char op=s[pos++]; double r=power();
+            if ((op=='/'||op=='%') && r==0.0) { err=true; return 0; }
+            if      (op=='*') v*=r;
+            else if (op=='/') v/=r;
+            else              v=fmod(v,r);
+            skip();
+        }
+        return v;
+    }
+    double power() {
+        double base=unary(); skip();
+        if (s[pos]=='^') { pos++; double e=unary(); return pow(base,e); }
+        return base;
+    }
+    double unary() {
+        skip();
+        if (s[pos]=='-') { pos++; return -unary(); }
+        if (s[pos]=='+') { pos++; return  unary(); }
+        return primary();
+    }
+    double primary() {
+        skip();
+        if (s[pos]=='(') {
+            pos++;
+            double v=expr(); skip();
+            if (s[pos]==')') pos++; else err=true;
+            return v;
+        }
+        if (!isdigit((unsigned char)s[pos]) && s[pos]!='.') {
+            err=true;
+            snprintf(errAt, sizeof(errAt), "near: %.16s", s+pos);
+            return 0;
+        }
+        char* end;
+        double v=strtod(s+pos, &end);
+        pos=(int)(end-s);
+        return v;
+    }
+};
+
+void cmd_math(String args) {
+    if (args.length() == 0) {
+        termPrint("Error: no expression.", COL_ERROR);
+        termPrint("       Usage: math <expression>", COL_DIM);
+        termPrint("       Ops:   + - * / % ^ ()", COL_DIM);
+        termPrint("       e.g.:  math (2 + 3) * 4^2", COL_DIM);
+        return;
+    }
+    MathParser p;
+    p.s   = args.c_str();
+    p.pos = 0;
+    p.err = false;
+    p.errAt[0] = '\0';
+
+    double result = p.expr();
+    p.skip();
+
+    if (p.err || p.s[p.pos] != '\0') {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "math: syntax error %s", p.errAt);
+        termPrint(msg, COL_ERROR);
+        return;
+    }
+
+    char buf[48];
+    // Show as integer if result is whole and within safe range
+    if (result == floor(result) && fabs(result) < 1e15 && !isinf(result))
+        snprintf(buf, sizeof(buf), "= %.0f", result);
+    else if (isinf(result))
+        snprintf(buf, sizeof(buf), "= %s", result > 0 ? "inf" : "-inf");
+    else
+        snprintf(buf, sizeof(buf), "= %g", result);
+    termPrint(buf, COL_INFO);
+}
+
+// ================================================================
+// PING -- real ICMP ping via mbed ICMPSocket (raw sockets enabled on GIGA M7)
+// Runs in pingTask background thread so the shell stays responsive.
+// ================================================================
+static void pingTaskFn() {
+    while (true) {
+        pingEvt.wait_any(PINGEVT_START);
+        gPingRunning = true;
+
+        NetworkInterface* net = NetworkInterface::get_default_instance();
+        if (!net) {
+            termPrint("ping: no network interface.", COL_ERROR);
+            gPingRunning = false; termDirty = true; continue;
+        }
+
+        // DNS resolution
+        SocketAddress addr;
+        termPrintf(COL_TEXT, "Resolving %s...", gPingHost);
+        nsapi_error_t dns = net->gethostbyname(gPingHost, &addr);
+        if (dns != NSAPI_ERROR_OK) {
+            termPrintf(COL_ERROR, "ping: cannot resolve '%s' (err %d)", gPingHost, dns);
+            gPingRunning = false; termDirty = true; continue;
+        }
+
+        const char* ipStr = addr.get_ip_address();
+        termPrintf(COL_INFO, "PING %s (%s): %d packets", gPingHost, ipStr, gPingCount);
+
+        ICMPSocket icmp;
+        if (icmp.open(net) != NSAPI_ERROR_OK) {
+            termPrint("ping: failed to open ICMP socket.", COL_ERROR);
+            gPingRunning = false; termDirty = true; continue;
+        }
+        icmp.set_timeout(2000);
+
+        int sent=0, recv=0;
+        uint32_t minRtt=UINT32_MAX, maxRtt=0, totalRtt=0;
+
+        for (int seq = 1; seq <= gPingCount; seq++) {
+            uint32_t t0 = millis();
+            int res = icmp.ping(addr, 2000);   // timeout in ms is mandatory arg
+            uint32_t rtt = millis() - t0;
+            sent++;
+
+            if (res >= 0) {
+                recv++; totalRtt += rtt;
+                if (rtt < minRtt) minRtt = rtt;
+                if (rtt > maxRtt) maxRtt = rtt;
+                termPrintf(COL_TEXT, "64 bytes from %s: icmp_seq=%d ttl=57 time=%lu ms",
+                           ipStr, seq, rtt);
+            } else if (res == NSAPI_ERROR_TIMEOUT) {
+                termPrintf(COL_ERROR, "Request timeout for icmp_seq=%d", seq);
+            } else {
+                termPrintf(COL_ERROR, "ping: error %d on icmp_seq=%d", res, seq);
+            }
+            termDirty = true;
+            if (seq < gPingCount) rtos::ThisThread::sleep_for(1000);
+        }
+
+        icmp.close();
+
+        int loss = (int)(100.0f * (sent - recv) / sent);
+        termPrint("", COL_TEXT);
+        termPrintf(COL_DIM,  "--- %s ping statistics ---", gPingHost);
+        termPrintf(COL_TEXT, "%d packets sent, %d received, %d%% packet loss",
+                   sent, recv, loss);
+        if (recv > 0 && minRtt != UINT32_MAX)
+            termPrintf(COL_TEXT, "rtt min/avg/max = %lu/%lu/%lu ms",
+                       minRtt, totalRtt / recv, maxRtt);
+
+        gPingRunning = false;
+        termDirty = true;
+    }
+}
+
+void cmd_ping(String args) {
+    if (!gWifiConnected) {
+        termPrint("ping: not connected to WiFi.", COL_ERROR);
+        termPrint("      Use 'wifi connect SSID PASS' first.", COL_DIM);
+        return;
+    }
+    if (gPingRunning) {
+        termPrint("ping: already running. Wait for it to finish.", COL_ERROR);
+        return;
+    }
+
+    args.trim();
+    String host;
+    int count = -1;  // -1 = not specified
+
+    // Parse: ping <host> [-c N]  or  ping [-c N] <host>
+    int cIdx = args.indexOf("-c");
+    if (cIdx != -1) {
+        String afterC = args.substring(cIdx + 2); afterC.trim();
+        int sp = afterC.indexOf(' ');
+        String countStr = (sp == -1) ? afterC : afterC.substring(0, sp);
+        count = countStr.toInt();
+        if (count <= 0) {
+            termPrint("Error: -c requires a positive integer.", COL_ERROR);
+            return;
+        }
+        if (count > 500) count = 500;
+        // Host is whatever is NOT the -c section
+        host = args.substring(0, cIdx);
+        host.trim();
+        if (host.length() == 0 && sp != -1) {
+            host = afterC.substring(sp + 1); host.trim();
+        }
+    } else {
+        host = args;
+        count = 100;  // no -c = send 100 (infinite-ish; Ctrl+C not implemented yet)
+    }
+
+    if (host.length() == 0) {
+        termPrint("Error: missing hostname or IP address.", COL_ERROR);
+        termPrint("       Usage: ping <host> [-c count]", COL_DIM);
+        termPrint("       e.g.:  ping 1.1.1.1 -c 4", COL_DIM);
+        termPrint("       e.g.:  ping google.com", COL_DIM);
+        return;
+    }
+
+    host.toCharArray(gPingHost, sizeof(gPingHost));
+    gPingCount = count;
+
+    if (count == 100 && cIdx == -1)
+        termPrint("(no -c given -- sending 100 packets)", COL_DIM);
+
+    pingEvt.set(PINGEVT_START);
+}
+
+// ================================================================
+// MEM -- heap memory usage
+// ================================================================
+void cmd_mem(String args) {
+    mbed_stats_heap_t heap;
+    mbed_stats_heap_get(&heap);
+
+    termPrint("-- Memory Usage -------------------------", COL_INFO);
+    if (heap.reserved_size > 0) {
+        uint32_t freeHeap = heap.reserved_size - heap.current_size;
+        uint8_t  pct      = (uint8_t)((heap.current_size * 100UL) / heap.reserved_size);
+        termPrintf(COL_TEXT, "  Heap used:    %6lu B  (%lu KB)", heap.current_size,  heap.current_size  / 1024);
+        termPrintf(COL_TEXT, "  Heap free:    %6lu B  (%lu KB)", freeHeap,            freeHeap           / 1024);
+        termPrintf(COL_TEXT, "  Heap total:   %6lu B  (%lu KB)", heap.reserved_size,  heap.reserved_size / 1024);
+        termPrintf(COL_TEXT, "  Heap peak:    %6lu B  (%lu KB)", heap.max_size,        heap.max_size      / 1024);
+        termPrintf(COL_TEXT, "  Usage:        %u%%", pct);
+        termPrintf(COL_DIM,  "  Allocs:       %lu ok,  %lu failed",
+                   heap.alloc_cnt, heap.alloc_fail_cnt);
+    } else {
+        termPrint("  Heap stats unavailable (mbed stats may not be active)", COL_DIM);
+    }
+    termPrint("", COL_TEXT);
+    termPrint("  -- SDRAM (8MB external) ------------------", COL_DIM);
+    extern uint32_t gbSdramUsage();
+    uint32_t gbSD = gbSdramUsage();
+    termPrintf(COL_TEXT, "  GBasic runtime+FS+vars: %5lu KB  (%lu MB)",
+               gbSD/1024, gbSD/(1024*1024));
+    termPrint("  GBasic breakdown:",                              COL_DIM);
+    termPrint("    Runtime structs: SDRAM.malloc (~400KB)",       COL_DIM);
+    termPrint("    Var stores:      up to 2MB (8 x 256KB)",       COL_DIM);
+    termPrint("    TempFS:          up to 3MB (.gbpf/.gbf/.ram)", COL_DIM);
+    termPrint("-----------------------------------------", COL_DIM);
+}
+
+// ================================================================
+// DATE -- shortcut for rtc show
+// ================================================================
+void cmd_date(String args) {
+    termPrint(rtcDateTime(), COL_INFO);
+    if (!gNtpSynced) termPrint("  (not NTP synced)", COL_DIM);
+}
+
+// ================================================================
+// UNAME -- board identification
+// ================================================================
+void cmd_uname(String args) {
+    termPrint("GigaOS 1.0-beta Arduino-GIGA STM32H747XI armv7em mbed-os", COL_INFO);
+}
+
+// ================================================================
+// COMMANDS -- ifconfig
+// ================================================================
+void cmd_ifconfig(String args) {
+    if (!gWifiConnected) {
+        termPrint("wlan0: not connected", COL_DIM);
+        termPrint("  run 'wifi setup' or 'wifi connect SSID PASS'", COL_DIM);
+        return;
+    }
+    IPAddress ip=WiFi.localIP(), sub=WiFi.subnetMask(), gw=WiFi.gatewayIP();
+    byte mac[6]; WiFi.macAddress(mac);
+    char buf[TERM_LINE_LEN];
+    termPrint("wlan0:", COL_INFO);
+    snprintf(buf,sizeof(buf),"  inet %d.%d.%d.%d  netmask %d.%d.%d.%d",
+             ip[0],ip[1],ip[2],ip[3],sub[0],sub[1],sub[2],sub[3]);
+    termPrint(buf,COL_TEXT);
+    snprintf(buf,sizeof(buf),"  gateway %d.%d.%d.%d",gw[0],gw[1],gw[2],gw[3]);
+    termPrint(buf,COL_TEXT);
+    snprintf(buf,sizeof(buf),"  ether %02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+    termPrint(buf,COL_TEXT);
+    snprintf(buf,sizeof(buf),"  ssid: %s  rssi: %ld dBm",WiFi.SSID(),(long)WiFi.RSSI());
+    termPrint(buf,COL_TEXT);
+}
+
+// ================================================================
+// COMMANDS -- nslookup
+// ================================================================
+void cmd_nslookup(String args) {
+    args.trim();
+    if (args.length()==0){termPrint("Error: missing hostname.",COL_ERROR);return;}
+    if (!gWifiConnected){termPrint("nslookup: not connected.",COL_ERROR);return;}
+    NetworkInterface* net=NetworkInterface::get_default_instance();
+    if (!net){termPrint("nslookup: no network interface.",COL_ERROR);return;}
+    SocketAddress addr;
+    nsapi_error_t err=net->gethostbyname(args.c_str(),&addr);
+    if (err==NSAPI_ERROR_OK){
+        termPrintf(COL_TEXT,"Name:    %s",args.c_str());
+        termPrintf(COL_TEXT,"Address: %s",addr.get_ip_address());
+    } else {
+        termPrintf(COL_ERROR,"nslookup: cannot resolve '%s' (err %d)",args.c_str(),err);
+    }
+}
+
+// ================================================================
+// COMMANDS -- threads
+// ================================================================
+void cmd_threads(String args) {
+    // Use CMSIS-RTOS2 osThreadEnumerate to get thread IDs and names.
+    // mbed_stats_thread_t has no name field; osThreadGetName() does.
+    const int MAX_T = 32;
+    osThreadId_t tids[MAX_T];
+    uint32_t cnt = osThreadEnumerate(tids, MAX_T);
+
+    if (cnt == 0) { termPrint("threads: no data.", COL_DIM); return; }
+
+    static const char* stNames[] = {
+        "Inactive", "Ready", "Running", "Blocked", "Terminated", "Error"
+    };
+    auto stateName = [&](osThreadState_t s) -> const char* {
+        switch(s) {
+            case osThreadInactive:   return "Inactive";
+            case osThreadReady:      return "Ready";
+            case osThreadRunning:    return "Running";
+            case osThreadBlocked:    return "Blocked";
+            case osThreadTerminated: return "Terminated";
+            case osThreadError:      return "Error";
+            default:                 return "?";
+        }
+    };
+
+    termPrint("-- RTOS Threads ------------------------------------------------", COL_INFO);
+    termPrint("  NAME                           STATE       PRIO  FREE STK", COL_DIM);
+    termPrint("  -------------------------------------------------------------", COL_DIM);
+
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char*    name  = osThreadGetName(tids[i]);
+        osThreadState_t state = osThreadGetState(tids[i]);
+        osPriority_t   prio  = osThreadGetPriority(tids[i]);
+        uint32_t       free  = osThreadGetStackSpace(tids[i]);
+
+        char buf[TERM_LINE_LEN];
+        snprintf(buf, sizeof(buf), "  %-30s %-11s %3d   %5luB",
+                 name ? name : "(unnamed)",
+                 stateName(state),
+                 (int)prio,
+                 free);
+        // highlight GigaOS and GBasic threads differently
+        uint16_t col = COL_TEXT;
+        if (name && strncmp(name, "GBasic", 6) == 0) col = COL_INFO;
+        termPrint(buf, col);
+    }
+
+    termPrint("  -------------------------------------------------------------", COL_DIM);
+    termPrintf(COL_DIM, "  %lu threads total  |  PRIO: higher number = higher priority", cnt);
+    termPrint("", COL_TEXT);
+}
+
+// ================================================================
+// COMMANDS -- units converter
+// ================================================================
+void cmd_units(String args) {
+    args.trim();
+    int sp1=args.indexOf(' ');
+    if (sp1==-1){
+        termPrint("Error: units <value> <from> <to>",COL_ERROR);
+        termPrint("  e.g.: units 72 F C  |  units 100 km mi  |  units 5 kg lb",COL_DIM);
+        return;
+    }
+    float val=args.substring(0,sp1).toFloat();
+    String rest=args.substring(sp1+1); rest.trim();
+    int sp2=rest.indexOf(' ');
+    if (sp2==-1){termPrint("Error: missing 'to' unit.",COL_ERROR);return;}
+    String fr=rest.substring(0,sp2); fr.toLowerCase();
+    String to=rest.substring(sp2+1); to.trim(); to.toLowerCase();
+    float res; bool ok=true;
+    // Temperature
+    if      ((fr=="f"||fr=="fahrenheit")&&(to=="c"||to=="celsius"))  res=(val-32)*5.0f/9.0f;
+    else if ((fr=="c"||fr=="celsius")&&(to=="f"||to=="fahrenheit"))  res=val*9.0f/5.0f+32;
+    else if ((fr=="c"||fr=="celsius")&&to=="k")                      res=val+273.15f;
+    else if (fr=="k"&&(to=="c"||to=="celsius"))                      res=val-273.15f;
+    else if ((fr=="f"||fr=="fahrenheit")&&to=="k")                   res=(val-32)*5.0f/9.0f+273.15f;
+    else if (fr=="k"&&(to=="f"||to=="fahrenheit"))                   res=(val-273.15f)*9.0f/5.0f+32;
+    // Distance
+    else if (fr=="km"&&(to=="mi"||to=="miles"))   res=val*0.621371f;
+    else if ((fr=="mi"||fr=="miles")&&to=="km")   res=val*1.60934f;
+    else if (fr=="m"&&(to=="ft"||to=="feet"))     res=val*3.28084f;
+    else if ((fr=="ft"||fr=="feet")&&to=="m")     res=val*0.3048f;
+    else if (fr=="cm"&&(to=="in"||to=="inches"))  res=val*0.393701f;
+    else if ((fr=="in"||fr=="inches")&&to=="cm")  res=val*2.54f;
+    else if (fr=="mm"&&to=="in")  res=val*0.0393701f;
+    else if (fr=="in"&&to=="mm")  res=val*25.4f;
+    // Weight
+    else if (fr=="kg"&&(to=="lb"||to=="lbs"))     res=val*2.20462f;
+    else if ((fr=="lb"||fr=="lbs")&&to=="kg")     res=val*0.453592f;
+    else if (fr=="g"&&(to=="oz"||to=="ounces"))   res=val*0.035274f;
+    else if ((fr=="oz"||fr=="ounces")&&to=="g")   res=val*28.3495f;
+    // Speed
+    else if ((fr=="kmh"||fr=="km/h")&&(to=="mph"||to=="mi/h")) res=val*0.621371f;
+    else if ((fr=="mph"||fr=="mi/h")&&(to=="kmh"||to=="km/h")) res=val*1.60934f;
+    else if (fr=="m/s"&&(to=="kmh"||to=="km/h")) res=val*3.6f;
+    else if ((fr=="kmh"||fr=="km/h")&&to=="m/s") res=val/3.6f;
+    else if (fr=="m/s"&&(to=="mph"||to=="mi/h")) res=val*2.23694f;
+    else if ((fr=="mph"||fr=="mi/h")&&to=="m/s") res=val*0.44704f;
+    // Time
+    else if (fr=="s"&&to=="ms")  res=val*1000;
+    else if (fr=="ms"&&to=="s")  res=val/1000;
+    else if (fr=="s"&&to=="min") res=val/60;
+    else if (fr=="min"&&to=="s") res=val*60;
+    else if (fr=="min"&&to=="h") res=val/60;
+    else if (fr=="h"&&to=="min") res=val*60;
+    else if (fr=="s"&&to=="h")   res=val/3600;
+    else if (fr=="h"&&to=="s")   res=val*3600;
+    // Data
+    else if (fr=="b"&&to=="kb")  res=val/1024;
+    else if (fr=="kb"&&to=="mb") res=val/1024;
+    else if (fr=="mb"&&to=="gb") res=val/1024;
+    else if (fr=="gb"&&to=="mb") res=val*1024;
+    else if (fr=="mb"&&to=="kb") res=val*1024;
+    else if (fr=="kb"&&to=="b")  res=val*1024;
+    else { ok=false; }
+    if (!ok){
+        termPrintf(COL_ERROR,"units: unknown: %s to %s",fr.c_str(),to.c_str());
+        termPrint("  Supported: F/C/K  km/mi  m/ft  cm/in  mm/in",COL_DIM);
+        termPrint("             kg/lb  g/oz  kmh/mph  m/s  s/ms/min/h  B/KB/MB/GB",COL_DIM);
+        return;
+    }
+    char buf[TERM_LINE_LEN];
+    if (res==floor(res)&&fabs(res)<1e9)
+        snprintf(buf,sizeof(buf),"%g %s = %.0f %s",val,fr.c_str(),res,to.c_str());
+    else
+        snprintf(buf,sizeof(buf),"%g %s = %g %s",val,fr.c_str(),res,to.c_str());
+    termPrint(buf,COL_INFO);
+}
+
+// ================================================================
+// COMMANDS -- hex, bin (both accept any base, show all three)
+// ================================================================
+static long parseAnyBase(const char* s) {
+    if (!s||!*s) return 0;
+    if (s[0]=='0'&&(s[1]=='x'||s[1]=='X')) return strtol(s+2,nullptr,16);
+    if (s[0]=='0'&&(s[1]=='b'||s[1]=='B')) return strtol(s+2,nullptr,2);
+    return strtol(s,nullptr,10);
+}
+static void printAllBases(long val, uint16_t color) {
+    uint32_t uval=(uint32_t)val;
+    char binBuf[36]="0b";
+    if (uval==0){ strncat(binBuf,"0",sizeof(binBuf)-3); }
+    else {
+        char tmp[33]={};
+        int start=31;
+        while(start>0&&!((uval>>start)&1)) start--;
+        for(int i=start;i>=0;i--) tmp[start-i]=((uval>>i)&1)?'1':'0';
+        tmp[start+1]='\0';
+        strncat(binBuf,tmp,sizeof(binBuf)-3);
+    }
+    char buf[TERM_LINE_LEN];
+    if(val<0) snprintf(buf,sizeof(buf),"%ld  =  0x%08lX  =  %s  (signed)",val,(unsigned long)val,binBuf);
+    else      snprintf(buf,sizeof(buf),"%ld  =  0x%lX  =  %s",val,(unsigned long)val,binBuf);
+    termPrint(buf,color);
+}
+void cmd_hex(String args) {
+    args.trim();
+    if (args.length()==0){termPrint("Error: provide a number.",COL_ERROR);return;}
+    printAllBases(parseAnyBase(args.c_str()),COL_INFO);
+}
+void cmd_bin(String args) {
+    args.trim();
+    if (args.length()==0){termPrint("Error: provide a number.",COL_ERROR);return;}
+    printAllBases(parseAnyBase(args.c_str()),COL_INFO);
+}
+
+// ================================================================
+// COMMANDS -- i2c
+// ================================================================
+void cmd_i2c(String args) {
+    args.trim();
+    if (args.startsWith("scan")) {
+        Wire.begin();
+        termPrint("Scanning I2C bus (0x01-0x7F)...",COL_INFO);
+        int found=0;
+        for (uint8_t addr=1;addr<=127;addr++){
+            Wire.beginTransmission(addr);
+            if (Wire.endTransmission()==0){ termPrintf(COL_TEXT,"  Device at 0x%02X",addr); found++; }
+            delay(2);
+        }
+        termPrintf(found>0?COL_INFO:COL_DIM,"Scan complete -- %d device(s) found.",found);
+        return;
+    }
+    if (args.startsWith("read ")) {
+        String rest=args.substring(5); rest.trim();
+        int sp1=rest.indexOf(' ');
+        String addrStr=(sp1==-1)?rest:rest.substring(0,sp1);
+        int addr=(int)strtol(addrStr.c_str(),nullptr,0);
+        if (addr<=0||addr>127){termPrint("Error: address must be 0x01-0x7F.",COL_ERROR);return;}
+        int reg=-1,count=1;
+        if (sp1!=-1){
+            String rest2=rest.substring(sp1+1); rest2.trim();
+            int sp2=rest2.indexOf(' ');
+            String regStr=(sp2==-1)?rest2:rest2.substring(0,sp2);
+            reg=(int)strtol(regStr.c_str(),nullptr,0);
+            if(sp2!=-1){count=rest2.substring(sp2+1).toInt();if(count<=0)count=1;if(count>32)count=32;}
+        }
+        Wire.begin();
+        if (reg>=0){
+            Wire.beginTransmission((uint8_t)addr);
+            Wire.write((uint8_t)reg);
+            if(Wire.endTransmission(false)!=0){termPrintf(COL_ERROR,"i2c: no ACK from 0x%02X",addr);return;}
+        }
+        uint8_t rcvd=Wire.requestFrom((uint8_t)addr,(uint8_t)count);
+        if(rcvd==0){termPrintf(COL_ERROR,"i2c: no response from 0x%02X",addr);return;}
+        char line[TERM_LINE_LEN]="";
+        char prefix[24];
+        if(reg>=0) snprintf(prefix,sizeof(prefix),"0x%02X[0x%02X]: ",addr,reg);
+        else       snprintf(prefix,sizeof(prefix),"0x%02X: ",addr);
+        strncat(line,prefix,sizeof(line)-1);
+        while(Wire.available()){
+            char bs[6]; snprintf(bs,sizeof(bs),"0x%02X ",(uint8_t)Wire.read());
+            int rem=sizeof(line)-strlen(line)-1; if(rem>5)strncat(line,bs,rem);
+        }
+        termPrint(line,COL_TEXT);
+        return;
+    }
+    termPrint("Error: unknown i2c subcommand.",COL_ERROR);
+    termPrint("       i2c scan",COL_DIM);
+    termPrint("       i2c read <addr_hex> [reg_hex] [byte_count]",COL_DIM);
+}
+
+// ================================================================
+// COMMANDS -- gpio
+// ================================================================
+void cmd_gpio(String args) {
+    args.trim();
+    int sp=args.indexOf(' ');
+    if (sp==-1){
+        termPrint("Error: missing pin.",COL_ERROR);
+        termPrint("  gpio <pin> read",COL_DIM);
+        termPrint("  gpio <pin> write <high|low>",COL_DIM);
+        termPrint("  gpio <pin> mode <input|output|input_pullup>",COL_DIM);
+        termPrint("  gpio <pin> adc   (16-bit analog read, ref 3.3V)",COL_DIM);
+        termPrint("  GIGA is 3.3V -- do NOT apply 5V to any pin!",COL_DIM);
+        return;
+    }
+    int pin=args.substring(0,sp).toInt();
+    String sub=args.substring(sp+1); sub.trim();
+    if (sub=="read"){
+        pinMode(pin,INPUT);
+        termPrintf(COL_INFO,"D%-2d = %s",pin,digitalRead(pin)?"HIGH":"LOW");
+    } else if (sub=="high"||sub=="write high"||sub=="write 1"){
+        pinMode(pin,OUTPUT); digitalWrite(pin,HIGH);
+        termPrintf(COL_INFO,"D%-2d -> HIGH",pin);
+    } else if (sub=="low"||sub=="write low"||sub=="write 0"){
+        pinMode(pin,OUTPUT); digitalWrite(pin,LOW);
+        termPrintf(COL_INFO,"D%-2d -> LOW",pin);
+    } else if (sub.startsWith("write ")){
+        String v=sub.substring(6); v.trim();
+        if(v=="high"||v=="1"){pinMode(pin,OUTPUT);digitalWrite(pin,HIGH);termPrintf(COL_INFO,"D%-2d -> HIGH",pin);}
+        else if(v=="low"||v=="0"){pinMode(pin,OUTPUT);digitalWrite(pin,LOW);termPrintf(COL_INFO,"D%-2d -> LOW",pin);}
+        else termPrint("Error: write value must be high/low/0/1.",COL_ERROR);
+    } else if (sub=="adc"){
+        analogReadResolution(16);
+        int raw=analogRead(pin);
+        termPrintf(COL_INFO,"A%-2d = %5d  (%.3f V)",pin,raw,raw*3.3f/65535.0f);
+    } else if (sub.startsWith("mode ")){
+        String m=sub.substring(5); m.trim();
+        if      (m=="input")       {pinMode(pin,INPUT);       termPrintf(COL_INFO,"D%-2d -> INPUT",pin);}
+        else if (m=="output")      {pinMode(pin,OUTPUT);      termPrintf(COL_INFO,"D%-2d -> OUTPUT",pin);}
+        else if (m=="input_pullup"){pinMode(pin,INPUT_PULLUP);termPrintf(COL_INFO,"D%-2d -> INPUT_PULLUP",pin);}
+        else termPrint("Error: mode must be input, output, or input_pullup.",COL_ERROR);
+    } else {
+        termPrintf(COL_ERROR,"Error: unknown gpio subcommand '%s'",sub.c_str());
+        termPrint("       gpio <pin> read | write <high|low> | mode <...> | adc",COL_DIM);
+    }
+}
+
+void cmd_sysinfo(String args) {
+    mbed_stats_sys_t sys;
+    mbed_stats_sys_get(&sys);
+
+    // Decode compiler ID to a human name
+    const char* compName;
+    switch (sys.compiler_id) {
+        case 1:  compName = "ARM Compiler 5"; break;
+        case 2:  compName = "ARM Compiler 6"; break;
+        case 3:  compName = "GCC ARM";        break;
+        case 4:  compName = "IAR";            break;
+        default: compName = "Unknown";        break;
+    }
+
+    // Decode compiler version -- encoded as Mmmmpppp (major, minor, patch)
+    uint32_t cv    = sys.compiler_version;
+    uint32_t cmaj  = cv / 1000000;
+    uint32_t cmin  = (cv % 1000000) / 1000;
+    uint32_t cpat  = cv % 1000;
+
+    // Decode mbed OS version -- encoded as Mmmpppp
+    uint32_t ov    = sys.os_version;
+    uint32_t omaj  = ov / 10000;
+    uint32_t omin  = (ov % 10000) / 100;
+    uint32_t opat  = ov % 100;
+
+    termPrint("-- System Information -------------------", COL_INFO);
+
+    // OS + compiler
+    termPrintf(COL_TEXT, "  mbed OS version:  %lu.%lu.%lu  (raw: %lu)",
+               omaj, omin, opat, ov);
+    termPrintf(COL_TEXT, "  Compiler:         %s", compName);
+    termPrintf(COL_TEXT, "  Compiler version: %lu.%lu.%lu  (raw: %lu)",
+               cmaj, cmin, cpat, cv);
+    termPrintf(COL_TEXT, "  CPU ID register:  0x%08lX", sys.cpu_id);
+
+    // RAM regions
+    termPrint("  RAM regions:", COL_DIM);
+    for (int i = 0; i < MBED_MAX_MEM_REGIONS; i++) {
+        if (sys.ram_size[i] == 0) continue;
+        termPrintf(COL_TEXT, "    [%d] start: 0x%08lX  size: %lu bytes (%lu KB)",
+                   i,
+                   sys.ram_start[i],
+                   sys.ram_size[i],
+                   sys.ram_size[i] / 1024);
+    }
+
+    // ROM regions
+    termPrint("  ROM regions:", COL_DIM);
+    for (int i = 0; i < MBED_MAX_MEM_REGIONS; i++) {
+        if (sys.rom_size[i] == 0) continue;
+        termPrintf(COL_TEXT, "    [%d] start: 0x%08lX  size: %lu bytes (%lu KB)",
+                   i,
+                   sys.rom_start[i],
+                   sys.rom_size[i],
+                   sys.rom_size[i] / 1024);
+    }
+
+    // Heap
+    mbed_stats_heap_t heap;
+    mbed_stats_heap_get(&heap);
+    termPrint("  Heap:", COL_DIM);
+    if (heap.reserved_size > 0) {
+        termPrintf(COL_TEXT, "    used %lu KB / %lu KB  (%u%%)",
+                   heap.current_size / 1024,
+                   heap.reserved_size / 1024,
+                   (uint8_t)((heap.current_size * 100UL) / heap.reserved_size));
+    } else {
+        termPrint("    (unavailable)", COL_DIM);
+    }
+
+    termPrint("-----------------------------------------", COL_DIM);
+}
+
+// ================================================================
+// BACKGROUND TASK -- WiFi
+// Runs at low priority. Waits for signals from cmd_wifi.
+// Never blocks the main UI thread.
+// ================================================================
+static void wifiTaskFn() {
+    while (true) {
+        uint32_t flags = wifiEvt.wait_any(WIFIEVT_CONNECT | WIFIEVT_DISCONNECT);
+
+        if (flags & WIFIEVT_DISCONNECT) {
+            WiFi.disconnect();
+            gWifiConnected  = false;
+            gWifiConnecting = false;
+            termPrint("WiFi: disconnected.", COL_INFO);
+            termDirty = true;
+        }
+
+        if (flags & WIFIEVT_CONNECT) {
+            WiFi.begin(gWifiSSID, gWifiPass);
+            int tries = 0;
+            while (WiFi.status() != WL_CONNECTED && tries < 30) {
+                rtos::ThisThread::sleep_for(1000);
+                tries++;
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                gWifiConnected  = true;
+                gWifiConnecting = false;
+                IPAddress ip = WiFi.localIP();
+                termPrintf(COL_INFO, "WiFi connected! IP: %d.%d.%d.%d",
+                           ip[0], ip[1], ip[2], ip[3]);
+            } else {
+                gWifiConnected  = false;
+                gWifiConnecting = false;
+                int wst = WiFi.status();
+                if      (wst == WL_CONNECT_FAILED) termPrint("WiFi: wrong password.", COL_ERROR);
+                else if (wst == WL_NO_SSID_AVAIL)  termPrintf(COL_ERROR, "WiFi: SSID '%s' not found.", gWifiSSID);
+                else                               termPrintf(COL_ERROR, "WiFi: connection failed (status %d).", wst);
+            }
+            termDirty = true;
+        }
+    }
+}
+
+// ================================================================
+// BACKGROUND TASK -- CPU stats (every 1 second)
+// Uses mbed_stats_cpu_get() -- confirmed working on GIGA R1.
+// MBED_ALL_STATS_ENABLED=1 is compiled into libmbed.a for this variant.
+// Measures all-thread idle time (not just main thread).
+// Runs at below-normal priority so it never starves the UI.
+// ================================================================
+static void statsTaskFn() {
+    while (true) {
+        rtos::ThisThread::sleep_for(1000);
+
+        mbed_stats_cpu_t cpu;
+        mbed_stats_cpu_get(&cpu);
+
+        uint64_t idleDelta = cpu.idle_time - gPrevIdle;
+        uint64_t upDelta   = cpu.uptime    - gPrevUp;
+
+        statMtx.lock();
+        if (upDelta > 0)
+            gBusy1s = 100.0f - (float)((idleDelta * 100ULL) / upDelta);
+        gTempF = readTempF();
+        statMtx.unlock();
+
+        gPrevIdle = cpu.idle_time;
+        gPrevUp   = cpu.uptime;
+    }
+}
+
+// gbasic.h must be included AFTER global objects so its functions
+// can see display, keyb, dispMtx etc. (all declared above this line)
+#include "gbasic.h"
+
+// ================================================================
+// SETUP
+// ================================================================
+void setup() {
+    Serial.begin(115200);
+
+    // Enable USB-A port for keyboard -- required before keyb.begin()
+    pinMode(PA_15, OUTPUT);
+    digitalWrite(PA_15, HIGH);
+
+    // Init SDRAM (available to apps via SDRAM.malloc())
+    SDRAM.begin();
+
+    // Init GBasic temp filesystem and var region in SDRAM
+    gbInit();
+
+    // Init display -- setRotation(1) forces landscape (800x480)
+    display.begin();
+    display.setRotation(1);
+    display.fillScreen(COL_BG);
+
+    // Init keyboard
+    keyb.begin();
+
+    // Clear input buffer
+    memset(inputBuf, 0, sizeof(inputBuf));
+
+    // Initial render
+    drawTopBar();
+    drawTerminal();
+
+    // Boot banner
+    termPrint("",                                                      COL_TEXT);
+    termPrint("  GigaOS v1.0 beta",                                   COL_INFO);
+    termPrint("  Arduino GIGA R1 WiFi  |  STM32H747XI  |  M7@480MHz", COL_DIM);
+    termPrint("  1MB SRAM + 8MB SDRAM  |  mbed OS",                   COL_DIM);
+    char cmdCountBuf[48];
+    snprintf(cmdCountBuf, sizeof(cmdCountBuf),
+             "  %d commands loaded", CMD_COUNT);
+    termPrint(cmdCountBuf,                                             COL_DIM);
+    termPrint("",                                                      COL_TEXT);
+    termPrint("  Type 'help' to list commands.",                       COL_TEXT);
+    termPrint("  Type 'rtc set HH:MM:SS DD/MM/YYYY' to set the clock.",COL_DIM);
+    termPrint("",                                                      COL_TEXT);
+
+    // Start background threads
+    // Stats task: below normal so UI is never starved
+    statsTask.start(statsTaskFn);
+
+    // WiFi task: low priority, only runs when signaled
+    wifiTask.start(wifiTaskFn);
+
+    // Ping task: low priority, runs when signaled by cmd_ping
+    pingTask.start(pingTaskFn);
+
+    // GBasic scheduler: checks RTC every minute for scheduled scripts
+    gbasicSched.start(gbSchedulerTaskFn);
+
+    termDirty = true;
+}
+
+// ================================================================
+// LOOP -- keyboard polling and shell dispatch
+// This is the main/OS thread. Has highest effective priority
+// since background threads are below-normal and low.
+// ================================================================
+void loop() {
+    // TOP BAR: always, regardless of mode
+    static uint32_t lastTopBarMs = 0;
+    if (millis() - lastTopBarMs >= 1000) { drawTopBar(); lastTopBarMs = millis(); }
+
+    // Route rendering and keyboard by app mode
+    if (gOSMode == 1) {
+        gbEditorLoop();
+        rtos::ThisThread::yield();
+        return;
+    }
+    if (gOSMode == 2) {
+        gbRunnerLoop();
+        rtos::ThisThread::yield();
+        return;
+    }
+
+    // MODE_SHELL -- normal GigaOS terminal
+    if (termDirty) drawTerminal();
+
+    // Cursor blink: toggle every 500ms, reset to visible on keypress
+    if (millis() - gLastCursorToggle >= 500) {
+        gCursorVisible = !gCursorVisible;
+        gLastCursorToggle = millis();
+        drawInputCursorOnly();
+    }
+
+    // Keyboard: drain ALL pending events before rendering
+    while (keyb.available()) {
+        auto     rawKey = keyb.read();
+        uint8_t  hid    = rawKey.keys[0];
+        char     c      = keyb.getAscii(rawKey);
+        uint32_t now    = millis();
+
+        // Debounce
+        if (hid == lastHIDKey && (now - lastKeyMs) < 100) continue;
+        if (hid != lastHIDKey && (now - lastKeyMs) < 10)  continue;
+        lastHIDKey = hid; lastKeyMs = now;
+
+        // Any keypress resets cursor blink to visible
+        gCursorVisible = true; gLastCursorToggle = millis();
+
+        // Escape -- cancel interactive modes
+        if (hid == 0x29) {
+            if (gInputMode != MODE_SHELL) {
+                gInputMode = MODE_SHELL; gPassMasked = false;
+                inputLen = 0; memset(inputBuf, 0, sizeof(inputBuf));
+                termPrint("Cancelled.", COL_DIM); termDirty = true;
+            }
+            drawInput(); continue;
+        }
+
+        // Capslock (shell mode only)
+        if (hid == 0x39 && gInputMode == MODE_SHELL) {
+            gCapslockOn = !gCapslockOn; drawInput(); continue;
+        }
+
+        // Up arrow (0x52) -- history older
+        if (hid == 0x52 && gInputMode == MODE_SHELL) {
+            if (historyCount > 0) {
+                if (historyIdx == -1) { historySaved = String(inputBuf); historyIdx = 0; }
+                else if (historyIdx < historyCount - 1) historyIdx++;
+                int ap = ((historyPos - 1 - historyIdx) % HISTORY_SIZE + HISTORY_SIZE) % HISTORY_SIZE;
+                strncpy(inputBuf, cmdHistory[ap].c_str(), sizeof(inputBuf) - 1);
+                inputBuf[sizeof(inputBuf)-1] = '\0';
+                inputLen = strlen(inputBuf); drawInput();
+            }
+            continue;
+        }
+
+        // Down arrow (0x51) -- history newer
+        if (hid == 0x51 && gInputMode == MODE_SHELL) {
+            if (historyIdx != -1) {
+                historyIdx--;
+                if (historyIdx < 0) {
+                    historyIdx = -1;
+                    strncpy(inputBuf, historySaved.c_str(), sizeof(inputBuf) - 1);
+                } else {
+                    int ap = ((historyPos - 1 - historyIdx) % HISTORY_SIZE + HISTORY_SIZE) % HISTORY_SIZE;
+                    strncpy(inputBuf, cmdHistory[ap].c_str(), sizeof(inputBuf) - 1);
+                }
+                inputBuf[sizeof(inputBuf)-1] = '\0';
+                inputLen = strlen(inputBuf); drawInput();
+            }
+            continue;
+        }
+
+        // Backspace -- HID first (confirmed getAscii() bug: maps 0x2A to '\r')
+        if (hid == 0x2A || hid == 0x4C || c == 8 || c == 127) {
+            if (inputLen > 0) { inputBuf[--inputLen] = '\0'; drawInput(); }
+
+        // Enter
+        } else if (c == '\r' || c == '\n') {
+            if (gInputMode == MODE_WIFI_SSID) {
+                if (inputLen == 0) {
+                    termPrint("(no SSID -- cancelled)", COL_DIM);
+                    gInputMode = MODE_SHELL; gPassMasked = false;
+                } else {
+                    inputBuf[inputLen] = '\0';
+                    strncpy(gWifiSSID, inputBuf, sizeof(gWifiSSID));
+                    termPrintf(COL_DIM, "  Network: %s", gWifiSSID);
+                    gInputMode = MODE_WIFI_PASS; gPassMasked = true;
+                }
+                inputLen = 0; memset(inputBuf, 0, sizeof(inputBuf));
+                termDirty = true; drawInput();
+            } else if (gInputMode == MODE_WIFI_PASS) {
+                inputBuf[inputLen] = '\0';
+                strncpy(gWifiPass, inputBuf, sizeof(gWifiPass));
+                termPrint("  Password: ********", COL_DIM);
+                inputLen = 0; memset(inputBuf, 0, sizeof(inputBuf));
+                gInputMode = MODE_SHELL; gPassMasked = false;
+                gWifiConnecting = true; gWifiConnected = false;
+                termPrintf(COL_INFO, "Connecting to [%s]...", gWifiSSID);
+                wifiEvt.set(WIFIEVT_CONNECT);
+                termDirty = true; drawInput();
+            } else if (inputLen > 0) {
+                inputBuf[inputLen] = '\0';
+                String cmd = String(inputBuf);
+                inputLen = 0; memset(inputBuf, 0, sizeof(inputBuf));
+                historyIdx = -1; historySaved = "";
+                dispatch(cmd);
+                termDirty = true; drawInput();
+            } else {
+                drawInput();
+            }
+
+        // Printable
+        } else if (c >= 32 && c < 127) {
+            int maxInput = TERM_COLS - strlen(currentPrompt());
+            if (inputLen < maxInput) {
+                char ch = c;
+                if (gCapslockOn && gInputMode == MODE_SHELL && isalpha((unsigned char)c))
+                    ch = islower((unsigned char)c) ? toupper(c) : tolower(c);
+                inputBuf[inputLen++] = ch;
+                inputBuf[inputLen]   = '\0';
+                drawInput();
+            }
+        }
+        // Left/right arrows + other specials: ignored (future: cursor-in-line movement)
+    }
+
+    // Serial input -- poll and dispatch complete lines
+    while (Serial.available()) {
+        char sc = (char)Serial.read();
+        if (!gSerialActive) {
+            // First byte ever received -- announce ourselves
+            gSerialActive = true;
+            Serial.println("\r\nGigaOS v1.0 beta  |  serial console active");
+            Serial.println("Type commands and press Enter. 'help' for list.");
+            Serial.println("Note: gbasic new/edit require the display; use gbasic run/list/files here.");
+            Serial.println("GigaOS> ");
+        }
+        if (sc == '\r') continue;           // ignore CR, wait for LF
+        if (sc == '\n' || sc == '\r') {
+            serialBuf[serialBufLen] = '\0';
+            String scmd = String(serialBuf);
+            serialBufLen = 0;
+            memset(serialBuf, 0, sizeof(serialBuf));
+            serialDispatch(scmd);
+        } else if (sc == 127 || sc == 8) {   // backspace
+            if (serialBufLen > 0) { serialBufLen--; Serial.print("\b \b"); }
+        } else if (serialBufLen < TERM_LINE_LEN - 1) {
+            serialBuf[serialBufLen++] = sc;
+            Serial.print(sc);               // local echo
+        }
+    }
+
+    // Yield to background threads.
+    // sleep_for(1) instead of yield() lets the idle thread actually run,
+    // which keeps the mbed CPU% stat accurate. Pure yield() busy-loops
+    // the main thread and starves idle, making CPU appear 100%.
+    rtos::ThisThread::sleep_for(1);
+}
