@@ -6,7 +6,7 @@ I tried to base it off of unix and threading with a philosophy around modularity
 
 Heres some stuff it has:
 - You can type in commands from arduino IDE's serial monitor if you wish instead of using a keyboard
-- GBasic, a coding language that was based off of.. BASIC!!!!!!!!! because I partially understand how to code in basic on my own without too much help
+- GBasic, a coding language that was based off of.. BASIC!!!!!!!!! because i came from tibasic its somewhat based off of that.
 - Chron but evil
 - An actual help command and paging the listed commands
 - Threading
